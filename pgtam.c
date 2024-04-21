@@ -1,4 +1,5 @@
 #include "postgres.h"
+#include <assert.h>
 #include "fmgr.h"
 #include "access/tableam.h"
 #include "access/heapam.h"
@@ -8,8 +9,16 @@
 #include "utils/builtins.h"
 #include "executor/tuptable.h"
 
+#include "rocksdb/c.h"
+
+PG_MODULE_MAGIC;
+
+const char DBPath[] = "/tmp/rocksdb_c_simple_example";
+
 FILE* fd;
 #define DEBUG_FUNC() fprintf(fd, "in %s\n", __func__)
+
+#define NTABLES_KEY "ntables"
 
 struct Column {
   int value;
@@ -33,19 +42,98 @@ struct Database {
   size_t ntables;
 };
 
-struct Database* database;
+struct rocksdb_t* database;
 
-static void get_table(struct Table** table, Relation relation) {
-  char* this_name = NameStr(relation->rd_rel->relname);
-  for (size_t i = 0; i < database->ntables; i++) {
-    if (strcmp(database->tables[i].name, this_name) == 0) {
-      *table = &database->tables[i];
-      return;
+static char* tableToString(struct Table table) {
+    // Calculate the total length needed for the string
+    size_t total_length = 0;
+    total_length += strlen("Table: ") + strlen(table.name) + strlen("\n");
+
+    // Iterate over rows and columns to calculate the length
+    for (size_t i = 0; i < table.nrows; ++i) {
+        total_length += strlen("Row: ") + 1; // 1 for newline character
+        for (size_t j = 0; j < table.rows[i].ncolumns; ++j) {
+            total_length += snprintf(NULL, 0, "%d ", table.rows[i].columns[j].value);
+        }
+        total_length += strlen("\n");
     }
-  }
+
+    // Allocate memory for the string
+    char* str = (char*)malloc((total_length + 1) * sizeof(char)); // +1 for null terminator
+
+    // Format table and rows into the string
+    sprintf(str, "Table: %s\n", table.name);
+    for (size_t i = 0; i < table.nrows; ++i) {
+        strcat(str, "Row: ");
+        for (size_t j = 0; j < table.rows[i].ncolumns; ++j) {
+            char col_str[20]; // Assuming maximum int length is 20
+            sprintf(col_str, "%d ", table.rows[i].columns[j].value);
+            strcat(str, col_str);
+        }
+        strcat(str, "\n");
+    }
+
+    DEBUG_FUNC();
+    return str;
 }
 
-PG_MODULE_MAGIC;
+
+static char* get_table_data(char* table_name) {
+  char *err = NULL;
+  rocksdb_readoptions_t *readoptions = rocksdb_readoptions_create();
+  size_t len;
+  char *returned_value =
+      rocksdb_get(database, readoptions, table_name, strlen(table_name), &len, &err);
+  assert(!err);
+
+  rocksdb_readoptions_destroy(readoptions);
+
+  DEBUG_FUNC();
+  return returned_value;
+}
+
+static void set_table_data(char* table_name, char* table_data) {
+  char *err = NULL;
+  rocksdb_writeoptions_t *writeoptions = rocksdb_writeoptions_create();
+
+  rocksdb_put(database, writeoptions, table_name, strlen(table_name), table_data, strlen(table_data) + 1, &err);
+  assert(!err);
+
+  DEBUG_FUNC();
+  rocksdb_writeoptions_destroy(writeoptions);
+}
+
+static int get_ntables() {
+  char *err = NULL;
+  rocksdb_readoptions_t *readoptions = rocksdb_readoptions_create();
+  size_t len;
+  char *returned_value =
+      rocksdb_get(database, readoptions, NTABLES_KEY, strlen(NTABLES_KEY), &len, &err);
+  assert(!err);
+
+  rocksdb_readoptions_destroy(readoptions);
+
+  DEBUG_FUNC();
+  return atoi(returned_value);
+}
+
+static void set_ntables(int ntables) {
+  char *err = NULL;
+  rocksdb_writeoptions_t *writeoptions = rocksdb_writeoptions_create();
+  char ntables_str[32];
+  snprintf(ntables_str, sizeof(ntables_str), "%d", ntables);
+  rocksdb_put(database, writeoptions, NTABLES_KEY, strlen(NTABLES_KEY), ntables_str, strlen(ntables_str) + 1, &err);
+  assert(!err);
+
+  DEBUG_FUNC();
+  rocksdb_writeoptions_destroy(writeoptions);
+}
+
+static void get_table(struct Table** table, Relation relation) {
+  int ntables = get_ntables();
+  char* this_name = NameStr(relation->rd_rel->relname);
+  get_table_data(this_name);
+}
 
 const TableAmRoutine memam_methods;
 
@@ -314,8 +402,11 @@ static void memam_relation_set_new_filelocator(
   table.rows = (struct Row*)malloc(sizeof(struct Row) * MAX_ROWS);
   table.nrows = 0;
 
-  database->tables[database->ntables] = table;
-  database->ntables++;
+  set_table_data(table.name, tableToString(table));
+
+  int ntables = get_ntables();
+  set_ntables(ntables + 1);
+
   DEBUG_FUNC();
 }
 
@@ -512,9 +603,18 @@ Datum mem_tableam_handler(PG_FUNCTION_ARGS) {
   fprintf(fd, "\n\nmem_tableam handler loaded\n");
 
   if (database == NULL) {
-    database = (struct Database*)malloc(sizeof(struct Database));
-    database->ntables = 0;
-    database->tables = (struct Table*)malloc(sizeof(struct Table) * MAX_TABLES);
+    rocksdb_options_t *options = rocksdb_options_create();
+    rocksdb_options_optimize_level_style_compaction(options, 0);
+    rocksdb_options_set_create_if_missing(options, 1);
+
+    char *err = NULL;
+    database = rocksdb_open(options, DBPath, &err);
+    assert(!err);
+
+    fprintf(fd, "RocksDB database opened at %s\n", DBPath);
+
+    set_ntables(0);
+    rocksdb_options_destroy(options);
   }
 
   PG_RETURN_POINTER(&memam_methods);
