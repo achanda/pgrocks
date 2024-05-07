@@ -8,15 +8,18 @@
 #include "commands/vacuum.h"
 #include "utils/builtins.h"
 #include "executor/tuptable.h"
+#include "utils/elog.h"
+#include "utils/lsyscache.h"
 
 #include "rocksdb/c.h"
 
 PG_MODULE_MAGIC;
 
-const char DBPath[] = "/tmp/rocksdb_c_simple_example";
+const char DBPath[] = "/tmp/rocksdb_data";
 
 FILE* fd;
-#define DEBUG_FUNC() fprintf(fd, "in %s\n", __func__)
+#define DEBUG_FUNC() elog(WARNING, "in %s\n", __func__)
+#define DEBUG_VAR_TYPE(var_name, var_value, format) elog(WARNING, "%s = " format "\n", #var_name, var_value)
 
 #define TABLES_KEY "tables"
 
@@ -43,6 +46,46 @@ struct Database {
 };
 
 struct rocksdb_t* database;
+
+static void add_row(char* table_name, size_t row, char* data) {
+  DEBUG_FUNC();
+  char *err = NULL;
+  rocksdb_writeoptions_t *writeoptions = rocksdb_writeoptions_create();
+  char* key = psprintf("%s#%zu", table_name, row);
+  rocksdb_put(database, writeoptions, key, strlen(key), data, strlen(data), &err);
+  assert(!err);
+  rocksdb_writeoptions_destroy(writeoptions);
+}
+
+static int get_max_row_num(char* table_name) {
+  DEBUG_FUNC();
+  rocksdb_readoptions_t *readoptions = rocksdb_readoptions_create();
+  rocksdb_iterator_t *iter = rocksdb_create_iterator(database, readoptions);
+  int max_row_num = -1;
+
+  char* prefix = psprintf("%s#", table_name);
+  size_t prefix_len = strlen(prefix);
+
+  for (rocksdb_iter_seek(iter, prefix, prefix_len); rocksdb_iter_valid(iter); rocksdb_iter_next(iter)) {
+    size_t len;
+    const char* key = rocksdb_iter_key(iter, &len);
+
+    if (len > prefix_len && strncmp(key, prefix, prefix_len) == 0) {
+      int current_row_num;
+      if (sscanf(key + prefix_len, "%d", &current_row_num) == 1) {
+        if (current_row_num > max_row_num) {
+          max_row_num = current_row_num;
+        }
+      }
+    }
+  }
+
+  rocksdb_iter_destroy(iter);
+  rocksdb_readoptions_destroy(readoptions);
+  pfree(prefix);
+
+  return max_row_num;
+}
 
 static char* get_tables() {
   char *err = NULL;
@@ -79,17 +122,6 @@ static char* get_table_data(char* table_name) {
 
   DEBUG_FUNC();
   return returned_value;
-}
-
-static void set_table_data(char* table_name, char* table_data) {
-  char *err = NULL;
-  rocksdb_writeoptions_t *writeoptions = rocksdb_writeoptions_create();
-
-  rocksdb_put(database, writeoptions, table_name, strlen(table_name), table_data, strlen(table_data) + 1, &err);
-  assert(!err);
-
-  DEBUG_FUNC();
-  rocksdb_writeoptions_destroy(writeoptions);
 }
 
 static void get_table(struct Table** table, Relation relation) {
@@ -194,6 +226,25 @@ static bool memam_index_fetch_tuple(
   return false;
 }
 
+static char *datumToString(Datum datum, Oid typeoid) {
+    char *result = NULL;
+    Oid typoutput;
+    bool typIsVarlena;
+    getTypeOutputInfo(typeoid, &typoutput, &typIsVarlena);
+
+    // For variable length types, detoast them if needed
+    if (typIsVarlena && !VARATT_IS_EXTENDED(datum)) {
+        datum = PointerGetDatum(PG_DETOAST_DATUM(datum));
+    }
+
+    // Convert the Datum to C string using the appropriate output function
+    result = OidOutputFunctionCall(typoutput, datum);
+
+    return result;
+}
+
+
+// TODO
 static void memam_tuple_insert(
   Relation relation,
   TupleTableSlot *slot,
@@ -201,37 +252,43 @@ static void memam_tuple_insert(
   int options,
   BulkInsertState bistate
 ) {
-  TupleDesc desc = RelationGetDescr(relation);
-  struct Table* table = NULL;
-  struct Column column = {};
-  struct Row row = {};
+  TupleDesc tupleDesc = RelationGetDescr(relation);
+  StringInfoData str;
+
+  initStringInfo(&str);
+
+  char *table_name = NameStr(relation->rd_rel->relname);
+
+  char *combined = NULL;
+  char *current;
 
   DEBUG_FUNC();
 
-  get_table(&table, relation);
-  if (table == NULL) {
-    elog(ERROR, "table not found");
-    return;
+
+  for (int i = 0; i < tupleDesc->natts; i++) {
+    bool isnull;
+    Datum value = slot_getattr(slot, i + 1, &isnull);
+    if (isnull) {
+      appendStringInfoString(&str, "NULL");
+      } else {
+        Oid typid = TupleDescAttr(tupleDesc, i)->atttypid;
+        char *valStr = datumToString(value, typid);
+        appendStringInfoString(&str, valStr);
+        pfree(valStr);
+      }
+    if (i < tupleDesc->natts - 1) {
+            appendStringInfoChar(&str, ',');  // Delimiting attributes
+    }
   }
 
-  if (table->nrows == MAX_ROWS) {
-    elog(ERROR, "cannot insert more rows");
-    return;
-  }
+  DEBUG_VAR_TYPE("tuple: ", str.data, "%s");
 
-  row.ncolumns = desc->natts;
-  Assert(slot->tts_nvalid == row.ncolumns);
-  Assert(row.ncolumns > 0);
+  int current_max_row_num = get_max_row_num(table_name);
 
-  row.columns = (struct Column*)malloc(sizeof(struct Column) * row.ncolumns);
-  for (size_t i = 0; i < row.ncolumns; i++) {
-    Assert(desc->attrs[i].atttypid == INT4OID);
-    column.value = DatumGetInt32(slot->tts_values[i]);
-    row.columns[i] = column;
-  }
+  DEBUG_VAR_TYPE("current max row: ", current_max_row_num, "%d");
+  add_row(table_name, current_max_row_num+1, combined);
 
-  table->rows[table->nrows] = row;
-  table->nrows++;
+  pfree(str.data);
 }
 
 static void memam_tuple_insert_speculative(
@@ -564,8 +621,6 @@ const TableAmRoutine memam_methods = {
 PG_FUNCTION_INFO_V1(mem_tableam_handler);
 
 Datum mem_tableam_handler(PG_FUNCTION_ARGS) {
-  fd = fopen("/tmp/pgtam.log", "a");
-  setvbuf(fd, NULL, _IONBF, 0);
   fprintf(fd, "\n\nmem_tableam handler loaded\n");
 
   if (database == NULL) {
@@ -578,7 +633,7 @@ Datum mem_tableam_handler(PG_FUNCTION_ARGS) {
     assert(!err);
 
     set_tables("");
-    fprintf(fd, "RocksDB database opened at %s\n", DBPath);
+    DEBUG_FUNC();
 
     rocksdb_options_destroy(options);
   }

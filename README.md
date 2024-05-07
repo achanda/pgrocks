@@ -1,8 +1,6 @@
-# pgtam
+# pgrocks
 
-An in-memory Table Access Method (i.e. storage engine) for Postgres.
-
-See also: https://notes.eatonphil.com/2023-11-01-postgres-table-access-methods.html.
+A RocksDB based Table Access Method (i.e. storage engine) for Postgres.
 
 ```
 $ make
